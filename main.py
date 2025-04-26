@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -10,22 +11,19 @@ import os
 import json
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-
 app = FastAPI()
 
-# Load data
-movies = pd.read_csv("data/movies.csv")
-ratings = pd.read_csv("data/ratings.csv")
-mapping = pd.read_csv("data/mapping.csv")
+# Load minimal data
+movies = pd.read_csv("data/movies.csv", usecols=["movieId", "title", "genres"], dtype={"movieId": "int32"})
+ratings = pd.read_csv("data/ratings.csv", usecols=["userId", "movieId", "rating"], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"})
+mapping = pd.read_csv("data/mapping.csv", dtype={"movieId": "int32", "tmdbId": "int32"})
 movies["clean_title"] = movies["title"].apply(lambda x: re.sub("[^a-zA-Z0-9 ]", "", x))
 vectorizer = TfidfVectorizer(ngram_range=(1, 2))
 tfidf = vectorizer.fit_transform(movies["clean_title"])
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 tmdb_cache = json.load(open("data/tmdb_cache.json")) if os.path.exists("data/tmdb_cache.json") else {}
 
-# Validate TMDB API key
 if not TMDB_API_KEY or TMDB_API_KEY == "your_tmdb_api_key":
     raise ValueError("TMDB_API_KEY is not set or invalid. Please set it in .env")
 
@@ -35,6 +33,8 @@ class RecommendationRequest(BaseModel):
     watched: list[int] | None = None
     user_id: str | None = None
 
+security = HTTPBearer()
+
 def search(title):
     title = re.sub("[^a-zA-Z0-9 ]", "", title)
     query_vec = vectorizer.transform([title])
@@ -43,12 +43,31 @@ def search(title):
     return movies.iloc[indices].iloc[::-1]
 
 def find_similar_movies(movie_id):
-    similar_users = ratings[(ratings["movieId"] == movie_id) & (ratings["rating"] > 4)]["userId"].unique()
-    similar_user_recs = ratings[(ratings["userId"].isin(similar_users)) & (ratings["rating"] > 4)]["movieId"]
+    # Process ratings in chunks
+    chunk_size = 1000000
+    similar_users = set()
+    for chunk in pd.read_csv("data/ratings.csv", usecols=["userId", "movieId", "rating"], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"}, chunksize=chunk_size):
+        similar_users.update(chunk[(chunk["movieId"] == movie_id) & (chunk["rating"] > 4)]["userId"].unique())
+    similar_users = list(similar_users)
+    
+    similar_user_recs = pd.Series(dtype="float32")
+    for chunk in pd.read_csv("data/ratings.csv", usecols=["userId", "movieId", "rating"], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"}, chunksize=chunk_size):
+        chunk_recs = chunk[(chunk["userId"].isin(similar_users)) & (chunk["rating"] > 4)]["movieId"]
+        similar_user_recs = pd.concat([similar_user_recs, chunk_recs])
+    
     similar_user_recs = similar_user_recs.value_counts() / len(similar_users)
     similar_user_recs = similar_user_recs[similar_user_recs > 0.10]
-    all_users = ratings[(ratings["movieId"].isin(similar_user_recs.index)) & (ratings["rating"] > 4)]
-    all_user_recs = all_users["movieId"].value_counts() / len(all_users["userId"].unique())
+    
+    all_users = set()
+    for chunk in pd.read_csv("data/ratings.csv", usecols=["userId", "movieId", "rating"], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"}, chunksize=chunk_size):
+        all_users.update(chunk[(chunk["movieId"].isin(similar_user_recs.index)) & (chunk["rating"] > 4)]["userId"].unique())
+    
+    all_user_recs = pd.Series(dtype="float32")
+    for chunk in pd.read_csv("data/ratings.csv", usecols=["userId", "movieId", "rating"], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"}, chunksize=chunk_size):
+        chunk_recs = chunk[(chunk["userId"].isin(all_users)) & (chunk["rating"] > 4)]["movieId"]
+        all_user_recs = pd.concat([all_user_recs, chunk_recs])
+    
+    all_user_recs = all_user_recs.value_counts() / len(all_users)
     rec_percentages = pd.concat([similar_user_recs, all_user_recs], axis=1)
     rec_percentages.columns = ["similar", "all"]
     rec_percentages["score"] = rec_percentages["similar"] / rec_percentages["all"]
@@ -80,15 +99,9 @@ def get_tmdb_metadata(tmdb_id):
 def recommend_movies(prompt=None, watchlist=None, watched=None, limit=7):
     watchlist = watchlist or []
     watched = watched or []
-
-    # Convert TMDB IDs to MovieLens IDs
     watchlist_ml = mapping[mapping["tmdbId"].isin(watchlist)]["movieId"].tolist()
     watched_ml = mapping[mapping["tmdbId"].isin(watched)]["movieId"].tolist()
-
-    # Initialize recommendations
     recs = pd.DataFrame()
-
-    # Handle prompt
     superhero_keywords = ["superhero", "marvel", "dc", "avengers", "spider-man", "batman", "superman"]
     if prompt:
         search_results = search(prompt)
@@ -97,34 +110,25 @@ def recommend_movies(prompt=None, watchlist=None, watched=None, limit=7):
             prompt_recs = find_similar_movies(movie_id)
             recs = pd.concat([recs, prompt_recs])
         if "star wars" in prompt.lower():
-            star_wars_id = mapping[mapping["tmdbId"] == 11]["movieId"].iloc[0]  # Star Wars (1977)
+            star_wars_id = mapping[mapping["tmdbId"] == 11]["movieId"].iloc[0]
             recs = pd.concat([recs, find_similar_movies(star_wars_id)])
-
-    # Handle watchlist and watched
-    superhero_tmdb_ids = [299536, 912649]  # Avengers, Venom
+    superhero_tmdb_ids = [299536, 912649]
     for movie_id in watchlist_ml + watched_ml:
         movie_recs = find_similar_movies(movie_id)
         recs = pd.concat([recs, movie_recs])
-
-    # Aggregate and filter
     if not recs.empty:
         recs = recs.groupby("movieId").agg({"score": "mean", "title": "first", "genres": "first"})
         recs = recs.reset_index().sort_values("score", ascending=False)
-        # Exclude watchlist and watched
         exclude_ids = set(watchlist_ml + watched_ml)
         recs = recs[~recs["movieId"].isin(exclude_ids)]
-        # Boost superhero movies
         if prompt and any(kw in prompt.lower() for kw in superhero_keywords) or any(tmdb_id in watchlist + watched for tmdb_id in superhero_tmdb_ids):
             recs.loc[recs["genres"].str.contains("Action|Sci-Fi|Adventure"), "score"] *= 1.5
         recs = recs.head(limit)
     else:
-        # Fallback: Top-rated action/sci-fi
         recs = movies[movies["genres"].str.contains("Action|Sci-Fi")]
         recs = recs.merge(ratings.groupby("movieId")["rating"].mean(), on="movieId")
         recs = recs.sort_values("rating", ascending=False).head(limit)
         recs["score"] = recs["rating"]
-
-    # Convert to TMDB format
     results = []
     for _, row in recs.iterrows():
         movie_id = row["movieId"]
@@ -149,12 +153,17 @@ def recommend_movies(prompt=None, watchlist=None, watched=None, limit=7):
                 "release_date": "",
                 "genres": row["genres"].split("|")
             })
-
     return results[:limit]
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 @app.post("/recommend")
-async def recommend(request: RecommendationRequest):
+async def recommend(request: RecommendationRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
+        token = credentials.credentials
+        # Add Firebase token verification here if needed
         print(f"Processing request: prompt={request.prompt}, watchlist={request.watchlist}, watched={request.watched}, user_id={request.user_id}")
         results = recommend_movies(request.prompt, request.watchlist, request.watched)
         print(f"Recommendations: {[r['title'] for r in results]}")
